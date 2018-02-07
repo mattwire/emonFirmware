@@ -1,40 +1,5 @@
 /*
-  emonTx V3 Pulse example -----------------------------------------
-
-  Many meters have pulse outputs, including electricity meters: single phase, 3-phase, 
-  import, export.. Gas meters, Water flow meters etc
-
-  The pulse output may be a flashing LED or a switching relay (usually solid state) or both.
-
-  In the case of an electricity meter a pulse output corresponds to a certain amount of 
-  energy passing through the meter (Kwhr/Wh). For single-phase domestic electricity meters
-  (eg. Elster A100c) each pulse usually corresponds to 1 Wh (1000 pulses per kwh).  
-
-  The code below detects the falling edge of each pulse and increment pulseCount
-  
-  It calculated the power by the calculating the time elapsed between pulses.
-  
-  Read more about pulse counting here:
-  http://openenergymonitor.org/emon/buildingblocks/introduction-to-pulse-counting
- 
- -----------------------------------------emonTH Hardware Connections-----------------------------
- 
- Connect the pulse input into emonTH terminal block port 4 (IRQ 0 / Digital 2)
- See: http://wiki.openenergymonitor.org/index.php?title=EmonTH
- 
- 
- If your using an optical counter (e.g TSL256) you should connecting the power pin direct to the 3.3V (terminal block 2) or 5V (if running off 5V USB) (terminal port 1) and GND (terminal port 3)
- 
- emonTx V3 Terminal block: 
- port 1: 5V
- port 2: 3.3V
- port 3: GND
- port 4: IRQ 0 / Dig2
- 
- 
- 
- 
- -----------------------------------------
+  emonTH (ciseco) with Dallas and DHT sensors + HC-SR501 motion sensor 
 
   -----------------------------------------
   Part of the openenergymonitor.org project
@@ -43,35 +8,53 @@
   Authors: Glyn Hudson, Trystan Lea
   Builds upon JeeLabs RF12 library and Arduino
 
-  THIS SKETCH REQUIRES:
+    THIS SKETCH REQUIRES:
 
-  Libraries in the standard arduino libraries folder:
+  Libraries required:
+   - see platformio.ini
+   - recommend compiling with platformIO for auto library download https://guide.openenergymonitor.org/technical/compiling
+   - Arduino IDE can be used to compile but libs will need to be manually downloaded
+
  	- RFu JeeLib		https://github.com/openenergymonitor/rfu_jeelib
 
   Other files in project directory (should appear in the arduino tabs above)
 	- emontx_lib.ino
-*/
 
-/*Recommended node ID allocation
-------------------------------------------------------------------------------------------------------------
--ID-	-Node Type- 
-0	- Special allocation in JeeLib RFM12 driver - reserved for OOK use
-1-4     - Control nodes 
-5-10	- Energy monitoring nodes
-11-14	--Un-assigned --
-15-16	- Base Station & logging nodes
-17-30	- Environmental sensing nodes (temperature humidity etc.)
-31	- Special allocation in JeeLib RFM12 driver - Node31 can communicate with nodes on any network group
--------------------------------------------------------------------------------------------------------------
-*/
+Recommended node ID allocation
+  -----------------------------------------------------------------------------------------------------------
+  -ID-	-Node Type-
+  0	- Special allocation in JeeLib RFM12 driver - reserved for OOK use
+  1-4     - Control nodes
+  5-10	- Energy monitoring nodes
+  11-14	--Un-assigned --
+  15-16	- Base Station & logging nodes
+  17-30	- Environmental sensing nodes (temperature humidity etc.)
+  31	- Special allocation in JeeLib RFM12 driver - Node31 can communicate with nodes on any network group
 
-#define DEBUG 0                      //Set to 1 to few debug serial output, turning debug off increases battery life
+  -------------------------------------------------------------------------------------------------------------
+  Change log:
+  V1.5.0   - (06/02/2018) Implement config via EEPROM
 
-#define RF_freq RF12_433MHZ          // Frequency of RF12B module can be RF12_433MHZ, RF12_868MHZ or RF12_915MHZ. You should use the one matching the module you have.433MHZ, RF12_868MHZ or RF12_915MHZ. You should use the one matching the module you have.
-const int nodeID = 26;               // emonTx RFM12B node ID
-const int networkGroup = 210;        // emonTx RFM12B wireless network group - needs to be same as emonBase and emonGLCD needs to be same as emonBase and emonGLCD
+  -------------------------------------------------------------------------------------------------------------
+  emonhub.conf node decoder:
+  See: https://github.com/openenergymonitor/emonhub/blob/emon-pi/configuration.md
 
-const int UNO = 1;                   // Set to 0 if your not using the UNO bootloader (i.e using Duemilanove) - All Atmega's shipped from OpenEnergyMonitor come with Arduino Uno bootloader
+    [[23]]
+      nodename = emonTH_5
+      firmware = V2.x_emonTH_DHT22_DS18B20_Pulse
+      hardware = emonTH_(Node_ID_Switch_DIP1:OFF_DIP2:OFF)
+      [[[rx]]]
+         names = temperature, external temperature, humidity, battery, pulseCount
+         datacodes = h,h,h,h,L
+         scales = 0.1,0.1,0.1,0.1,1
+         units = C,C,%,V,p
+  */
+// -------------------------------------------------------------------------------------------------------------
+
+boolean debug=1;                                                      // Set to 1 to few debug serial output
+
+const unsigned int  version = 150;                                    // firmware version
+
 #include <avr/wdt.h>                 // the UNO bootloader 
 #include <avr/power.h>
 #include <avr/sleep.h>
@@ -80,6 +63,13 @@ const int UNO = 1;                   // Set to 0 if your not using the UNO bootl
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <DHT.h>                     // https://github.com/adafruit/DHT-sensor-library + https://github.com/adafruit/Adafruit_Sensor
+
+const int UNO = 1;                   // Set to 0 if your not using the UNO bootloader (i.e using Duemilanove) - All Atmega's shipped from OpenEnergyMonitor come with Arduino Uno bootloader
+boolean RF_STATUS;
+
+byte RF_freq=RF12_433MHZ;                                           // Frequency of RF12B module can be RF12_433MHZ, RF12_868MHZ or RF12_915MHZ. You should use the one matching the module you have.
+byte nodeID = 23;                                                      // EmonTH temperature RFM12B node ID - should be unique on network
+int networkGroup = 210;                                         // EmonTH RFM12B wireless network group - needs to be same as emonBase and emonGLCD
 
 ISR(WDT_vect) { Sleepy::watchdogEvent(); }
   
@@ -119,10 +109,23 @@ byte allAddress [4][8];  // 8 bytes per address
 
 volatile int count = 0;
 volatile bool changed = false;
+unsigned long start;
 
+const char helpText1[] PROGMEM =                                 // Available Serial Commands
+"\n"
+"Available commands:\n"
+"  <nn> i     - set node IDs (standard node ids are 1..30)\n"
+"  <n> b      - set MHz band (4 = 433, 8 = 868, 9 = 915)\n"
+"  <nnn> g    - set network group (RFM12 only allows 212, 0 = any)\n"
+"  s          - save config to EEPROM\n"
+"  v          - Show firmware version\n"
+;
 //################################################################################################################################
 //################################################################################################################################
+#ifndef UNIT_TEST // IMPORTANT LINE! // http://docs.platformio.org/en/stable/plus/unit-testing.html
+
 void setup() {
+//################################################################################################################################
   
   pinMode(LED,OUTPUT);
   digitalWrite(LED,HIGH);                       // Status LED on
@@ -130,21 +133,34 @@ void setup() {
   rf12_initialize(nodeID, RF_freq, networkGroup);                       // Initialize RFM12B
   rf12_sleep(RF12_SLEEP);
   
-#if (DEBUG == 1)
-  Serial.begin(9600);
-  Serial.println("emonTH"); 
-  Serial.println("OpenEnergyMonitor.org");
-  Serial.println("Version: V1.4.1");
-  Serial.print("Node: "); 
-  Serial.print(nodeID); 
-  Serial.print(" Freq: "); 
-  if (RF_freq == RF12_433MHZ) Serial.print("433Mhz");
-  if (RF_freq == RF12_868MHZ) Serial.print("868Mhz");
-  if (RF_freq == RF12_915MHZ) Serial.print("915Mhz"); 
-  Serial.print(" Network: "); 
-  Serial.println(networkGroup);
-  Sleepy::loseSomeTime(100);
-#endif
+  if (debug == 1) {
+    Serial.begin(115200);
+    Serial.println("OpenEnergyMonitor.org");
+    Serial.print("emonTH FW: V"); Serial.println(version);
+    delay(100);
+  }
+
+  RF_STATUS=1;
+
+  if (RF_STATUS==1){
+    load_config();                                                        // Load RF config from EEPROM (if any exist)
+
+    if (debug) Serial.println("Int RFM...");
+    rf12_initialize(nodeID, RF_freq, networkGroup);                       // Initialize RFM
+
+    if (debug){
+      Serial.println("RFM Started");
+      Serial.print("Node: ");
+      Serial.print(nodeID);
+      Serial.print(" Freq: ");
+      if (RF_freq == RF12_433MHZ) Serial.print("433Mhz");
+      if (RF_freq == RF12_868MHZ) Serial.print("868Mhz");
+      if (RF_freq == RF12_915MHZ) Serial.print("915Mhz");
+      Serial.print(" Network: ");
+      Serial.println(networkGroup);
+    }
+    Sleepy::loseSomeTime(100);
+  }
   
   pinMode(DHT22_PWR,OUTPUT);
   pinMode(DS18B20_PWR,OUTPUT);
@@ -152,12 +168,38 @@ void setup() {
   digitalWrite(DHT22_PWR,LOW);
 
   //################################################################################################################################
+  // RF Config mode
+  //################################################################################################################################
+  if (RF_STATUS==1){
+    Serial.println("");
+    Serial.println("'+++' then [Enter] for RF config mode");
+    Serial.println("waiting 5s...");
+    start = millis();
+    while (millis() < (start + 5000)){
+      // If serial input of keyword string '+++' is entered during 5s power-up then enter config mode
+      if (Serial.available()){
+        if ( Serial.readString() == "+++\r\n"){
+          Serial.println("Entering config mode...");
+          showString(helpText1);
+          // char c[]="v"
+          config(char('v'));
+          while(1){
+            if (Serial.available()){
+              config(Serial.read());
+            }
+          }
+        }
+      }
+    }
+  }
+
+  //################################################################################################################################
   // Power Save  - turn off what we don't need - http://www.nongnu.org/avr-libc/user-manual/group__avr__power.html
   //################################################################################################################################
   ACSR |= (1 << ACD);                     // disable Analog comparator    
-  #if (DEBUG==0)
-  power_usart0_disable();   //disable serial UART
-  #endif
+  if (debug==0) {
+    power_usart0_disable();   //disable serial UART
+  }
   power_twi_disable();                    //Disable the Two Wire Interface module.
   // power_timer0_disable();              //don't disable necessary for the DS18B20 library
   power_timer1_disable();
@@ -175,18 +217,18 @@ void setup() {
   
   if (isnan(t) || isnan(h))                                             // check if returns are valid, if they are NaN (not a number) then something went wrong!
   {
-    #if (DEBUG == 1)
-    Serial.println(" - Unable to find DHT22 Sensor..trying agin");
-    Sleepy::loseSomeTime(100);
-    #endif
+    if (debug == 1) {
+      Serial.println(" - Unable to find DHT22 Sensor..trying agin");
+      Sleepy::loseSomeTime(100);
+    }
     
     Sleepy::loseSomeTime(1500); 
     float h = dht.readHumidity();  float t = dht.readTemperature();
     if (isnan(t) || isnan(h))   
     {
-      #if (DEBUG == 1)
-      Serial.println(" - Unable to find DHT22 Sensor for 2nd time..giving up");
-      #endif
+      if (debug == 1) {
+        Serial.println(" - Unable to find DHT22 Sensor for 2nd time..giving up");
+      }
       
       DHT22_status=0;
     } 
@@ -194,9 +236,9 @@ void setup() {
   else 
   {
     DHT22_status=1;
-    #if (DEBUG == 1)
-    Serial.println("Detected DHT22 temp & humidity sensor");
-    #endif
+    if (debug == 1) {
+      Serial.println("Detected DHT22 temp & humidity sensor");
+    }
   }   
  
   //################################################################################################################################
@@ -214,18 +256,18 @@ void setup() {
   
   if (numSensors==0)
   {
-    #if (DEBUG == 1)
-    Serial.println("No DS18B20 detected");
-    #endif
+    if (debug == 1) {
+      Serial.println("No DS18B20 detected");
+    }
     DS18B20=0; 
   } 
   else 
   {
     DS18B20=1; 
-    #if (DEBUG == 1) 
+    if (debug == 1) {
       Serial.print("Detected "); Serial.print(numSensors); Serial.println(" DS18B20");
       if (DHT22_status==1) Serial.println("DS18B20 and DHT22 found, assuming DS18B20 is external sensor");
-    #endif
+    }
     
   }
   
@@ -245,9 +287,9 @@ void setup() {
   digitalWrite(LED,LOW);
 
   //if (UNO) wdt_enable(WDTO_8S);
-  #if (DEBUG ==1)
+  if (debug ==1) {
     Serial.println("Ready");
-  #endif
+  }
 } // end of setup
 
 void loop() 
@@ -256,10 +298,10 @@ void loop()
   if (lastPirValue != pirValue)
   {
     lastPirValue = pirValue;
-    #if (DEBUG == 1)
-    Serial.print("Motion: ");
-    Serial.print(pirValue);
-    #endif
+    if (debug == 1) {
+      Serial.print("Motion: ");
+      Serial.print(pirValue);
+    }
     emonth.motion = pirValue;
     changed = true;
   }
@@ -285,13 +327,13 @@ void loop()
     float temp=(dht.readTemperature());
     if ((temp<85.0) && (temp>-40.0)) emonth.temp = (temp*10);
 
-    #if (DEBUG == 1)
-    Serial.print(" Humidity: ");
-    Serial.print(humidity);
-    Serial.print("% Temperature: ");
-    Serial.print(temp);
-    Serial.println("C");
-    #endif
+    if (debug == 1) {
+      Serial.print(" Humidity: ");
+      Serial.print(humidity);
+      Serial.print("% Temperature: ");
+      Serial.print(temp);
+      Serial.println("C");
+    }
 
     digitalWrite(DHT22_PWR,LOW);
     changed = true;
@@ -300,9 +342,9 @@ void loop()
   if (changed == true)
   {
     changed = false;
-    #if (DEBUG==1)
-    Serial.println("send");
-    #endif
+    if (debug == 1) {
+      Serial.println("send");
+    }
     send_rf();
   }
 }
@@ -325,3 +367,5 @@ void pirChange()
   pirValue = !pirValue;
 }
 
+#endif    // IMPORTANT LINE! end unit test
+//http://docs.platformio.org/en/stable/plus/unit-testing.html
